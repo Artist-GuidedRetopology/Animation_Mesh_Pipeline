@@ -20,16 +20,18 @@ import importlib
 import random
 import sys
 import traceback
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import bpy
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+for _path in (SCRIPT_DIR, SCRIPT_DIR.parent):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 import dirty_topology_core
+from common.manifest import utc_now, write_stage_manifest
 
 importlib.reload(dirty_topology_core)
 from dirty_topology_core import DirtyParams, apply_dirty_topology_to_mesh
@@ -233,6 +235,7 @@ def run_pipeline(
     random_seed: int = RANDOM_SEED,
     skip_existing: bool = False,
 ) -> None:
+    started_at = utc_now()
     in_path = Path(bpy.path.abspath(input_dir)).expanduser().resolve()
     if not in_path.is_dir():
         raise FileNotFoundError(f"INPUT_DIR does not exist: {in_path}")
@@ -292,6 +295,24 @@ def run_pipeline(
         f"({len(strengths)} strengths × {ok} frames)."
     )
     log(summary)
+    write_stage_manifest(
+        in_path,
+        "stage2",
+        params={
+            "displace_strengths": strengths,
+            "export_format": export_format,
+            "random_seed": random_seed,
+            "skip_existing": skip_existing,
+            "dirty_params": asdict(params),
+        },
+        counts={
+            "clean_files": len(clean_files),
+            "clean_ok": ok,
+            "dirty_written": total_written,
+            "failed": len(clean_files) - ok,
+        },
+        started_at=started_at,
+    )
 
 
 def parse_args():

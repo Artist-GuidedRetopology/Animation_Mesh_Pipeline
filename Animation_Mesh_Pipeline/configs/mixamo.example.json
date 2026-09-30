@@ -1,0 +1,29 @@
+{
+  "_comment": "Relative paths resolve against this file's folder. Copy this file and edit. To split by character: python tools/make_splits.py --input_dir <stage1 input> --output configs/splits_mixamo.json --test \"Castle Guard 02\" then set stage3.args.splits.",
+  "blender": "/Applications/Blender.app/Contents/MacOS/Blender",
+  "work_dir": "../../../../Data/pipeline_runs/mixamo",
+  "stage1": {
+    "input_dir": "../../../../Mixamo_Data/ModelWithAnimationSelected",
+    "args": {
+      "frame_gap": 20,
+      "max_armatures": 10,
+      "seed": 42
+    }
+  },
+  "stage2": {
+    "args": {
+      "displace_strengths": [10, 40],
+      "seed": 42,
+      "skip_existing": true
+    }
+  },
+  "stage3": {
+    "args": {
+      "features": [
+        "position", "normal", "principal_directions", "curvature", "area", "aspect_ratio",
+        "skin_entropy", "skin_top_weights", "joint_distance", "bone_axis"
+      ],
+      "splits": null
+    }
+  }
+}

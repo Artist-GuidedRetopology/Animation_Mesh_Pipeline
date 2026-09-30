@@ -1,0 +1,15 @@
+{
+  "_comment": "Static meshes without skeleton: skip Stage 1, run Stage 2 in place on an existing <sample>/clean.fbx tree, then Stage 3 with the default (non-skinning) features.",
+  "blender": "/Applications/Blender.app/Contents/MacOS/Blender",
+  "work_dir": "../../../../Data/pipeline_runs/primitive",
+  "frames_dir": "../../../../Data/PrimitiveDataset",
+  "stage2": {
+    "args": {
+      "displace_strengths": [10, 40],
+      "skip_existing": true
+    }
+  },
+  "stage3": {
+    "args": {}
+  }
+}

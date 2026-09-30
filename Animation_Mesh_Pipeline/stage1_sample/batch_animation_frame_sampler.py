@@ -17,6 +17,11 @@ Batch Animation Frame Sampler (bpy).
 对每个角色：加载根目录角色 FBX → 把 animations/ 里的 Action 赋到角色骨架
 → 按 frame_gap 插针导出 clean。
 
+输出（供 Stage 2 / Stage 3 使用）：
+  <out>/<char>/skin.npz                     # 角色级蒙皮权重（bind pose）
+  <out>/<char>/<anim>_<frame>/clean.fbx     # 单个合并后的网格对象
+  <out>/<char>/<anim>_<frame>/pose.npz      # 该帧骨骼端点 + 顶点顺序校验
+
 用法（Blender background）:
   Blender --background --python stage1_sample/batch_animation_frame_sampler.py -- \\
     --input_dir "/path/to/ModelWithAnimationSelected" \\
@@ -32,22 +37,31 @@ import random
 import re
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
+import bmesh
 import bpy
+import numpy as np
 
 # =========================
 # 默认路径 / 可调参数
 # =========================
 SCRIPT_DIR = Path(__file__).resolve().parent
 PIPELINE_ROOT = SCRIPT_DIR.parent
+if str(PIPELINE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_ROOT))
+
+from common import skin_sidecar  # noqa: E402
+from common.manifest import utc_now, write_stage_manifest  # noqa: E402
+from common.naming import ANIMATIONS_SUBDIR, sanitize_name  # noqa: E402
+
 # stage1_sample → Animation_Mesh_Pipeline → Animation_Mesh_Pipeline → Scripts → Data_Processing
 PROJECT_ROOT = PIPELINE_ROOT.parent.parent.parent
 
 DEFAULT_INPUT_DIR = PROJECT_ROOT / "Mixamo_Data" / "ModelWithAnimationSelected"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "Data" / "output_animation_frames"
 
-ANIMATIONS_SUBDIR = "animations"
 FRAME_GAP = 20
 MAX_CHARACTERS = None  # None / <0 = 全部角色子目录
 CHARACTER_START = 0
@@ -87,10 +101,6 @@ def show_popup(title: str, message: str, icon: str = "INFO") -> None:
         wm.popup_menu(_draw, title=title, icon=icon)
     except Exception:
         pass
-
-
-def sanitize_name(name: str) -> str:
-    return re.sub(r"[^\w\-.]+", "_", name).strip("_") or "unnamed"
 
 
 def purge_orphans() -> None:
@@ -140,7 +150,11 @@ def get_primary_armature(objects: list[bpy.types.Object]) -> bpy.types.Object | 
 
 
 def collect_mesh_objects(objects: list[bpy.types.Object]) -> list[bpy.types.Object]:
-    return [o for o in objects if o.type == "MESH" and o.name in bpy.data.objects]
+    # Sorted: exported vertex order (and skin.npz rows) must not depend on set order.
+    return sorted(
+        (o for o in objects if o.type == "MESH" and o.name in bpy.data.objects),
+        key=lambda o: o.name,
+    )
 
 
 def probe_fbx_has_mesh(fbx_path: Path) -> bool:
@@ -410,18 +424,145 @@ def export_mesh_datablocks(
             bpy.ops.object.delete(use_global=True)
 
 
+def join_mesh_datablocks(mesh_datablocks: list[bpy.types.Mesh]) -> bpy.types.Mesh:
+    """Concatenate meshes in list order into one datablock (vertex order preserved)."""
+    bm = bmesh.new()
+    try:
+        for mesh in mesh_datablocks:
+            bm.from_mesh(mesh)
+        joined = bpy.data.meshes.new("mesh")
+        bm.to_mesh(joined)
+    finally:
+        bm.free()
+    return joined
+
+
+def mesh_vertex_positions(mesh: bpy.types.Mesh) -> np.ndarray:
+    coords = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coords)
+    return coords.reshape(-1, 3)
+
+
 def export_frame_clean(
     mesh_objects: list[bpy.types.Object],
     export_path: Path,
     export_format: str,
-) -> None:
+) -> np.ndarray:
+    """Export one joined clean mesh; return its world-space vertex positions."""
     eval_meshes = evaluate_mesh_datablocks(mesh_objects)
+    joined = None
     try:
-        export_mesh_datablocks(eval_meshes, export_path, export_format)
+        joined = join_mesh_datablocks(eval_meshes)
+        positions = mesh_vertex_positions(joined)
+        export_mesh_datablocks([joined], export_path, export_format)
+        return positions
     finally:
-        for mesh in eval_meshes:
-            if mesh.name in bpy.data.meshes:
+        for mesh in [*eval_meshes, joined]:
+            if mesh is not None and mesh.name in bpy.data.meshes:
                 bpy.data.meshes.remove(mesh)
+
+
+# =========================
+# Skin / pose sidecars
+# =========================
+@dataclass
+class SkinInfo:
+    bone_names: list[str]
+    vertex_count: int
+    check_indices: np.ndarray
+
+
+def deform_bone_names(armature_obj: bpy.types.Object) -> list[str]:
+    return [bone.name for bone in armature_obj.data.bones if bone.use_deform]
+
+
+def write_skin_sidecar(
+    mesh_objects: list[bpy.types.Object],
+    armature_obj: bpy.types.Object,
+    character_output: Path,
+) -> SkinInfo:
+    """Bind-pose weights of the sorted mesh objects, in exported vertex order."""
+    bone_names = deform_bone_names(armature_obj)
+    bone_index = {name: i for i, name in enumerate(bone_names)}
+
+    per_vertex: list[list[tuple[int, float]]] = []
+    rest_positions: list[np.ndarray] = []
+    offsets = [0]
+    for obj in mesh_objects:
+        group_to_bone = {
+            group.index: bone_index[group.name]
+            for group in obj.vertex_groups
+            if group.name in bone_index
+        }
+        for vertex in obj.data.vertices:
+            per_vertex.append([
+                (group_to_bone[g.group], float(g.weight))
+                for g in vertex.groups
+                if g.group in group_to_bone and g.weight > 0
+            ])
+        rest = mesh_vertex_positions(obj.data)
+        matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+        rest_positions.append(rest @ matrix[:3, :3].T + matrix[:3, 3])
+        offsets.append(offsets[-1] + len(obj.data.vertices))
+
+    rest_all = np.concatenate(rest_positions)
+    scale = float(2 * np.linalg.norm(rest_all - rest_all.mean(axis=0), axis=1).max())
+    indices, values = skin_sidecar.sparse_top_k(per_vertex)
+    world = armature_obj.matrix_world
+    bones = [armature_obj.data.bones[name] for name in bone_names]
+
+    skin_sidecar.save_skin(
+        character_output / skin_sidecar.SKIN_FILENAME,
+        skin_sidecar.SkinSidecar(
+            bone_names=bone_names,
+            weight_indices=indices,
+            weight_values=values,
+            rest_bone_heads=np.asarray([tuple(world @ b.head_local) for b in bones]).reshape(-1, 3),
+            rest_bone_tails=np.asarray([tuple(world @ b.tail_local) for b in bones]).reshape(-1, 3),
+            character_scale=scale,
+            object_names=[obj.name for obj in mesh_objects],
+            object_vertex_offsets=np.asarray(offsets),
+        ),
+    )
+    unbound = sum(1 for influences in per_vertex if not influences)
+    log(
+        f"  skin.npz: {len(per_vertex)} verts, {len(bone_names)} deform bones, "
+        f"{unbound} unbound verts"
+    )
+    return SkinInfo(
+        bone_names=bone_names,
+        vertex_count=len(per_vertex),
+        check_indices=skin_sidecar.check_vertex_indices(len(per_vertex)),
+    )
+
+
+def write_pose_sidecar(
+    armature_obj: bpy.types.Object,
+    skin_info: SkinInfo,
+    positions: np.ndarray,
+    sample_dir: Path,
+    frame: int,
+    animation: str,
+) -> None:
+    if len(positions) != skin_info.vertex_count:
+        raise RuntimeError(
+            f"Evaluated mesh has {len(positions)} verts, skin.npz has "
+            f"{skin_info.vertex_count}; a non-armature modifier changed topology"
+        )
+    world = armature_obj.matrix_world
+    pose_bones = [armature_obj.pose.bones[name] for name in skin_info.bone_names]
+    skin_sidecar.save_pose(
+        sample_dir / skin_sidecar.POSE_FILENAME,
+        skin_sidecar.PoseSidecar(
+            bone_names=skin_info.bone_names,
+            bone_heads=np.asarray([tuple(world @ pb.head) for pb in pose_bones]).reshape(-1, 3),
+            bone_tails=np.asarray([tuple(world @ pb.tail) for pb in pose_bones]).reshape(-1, 3),
+            frame=frame,
+            animation=animation,
+            check_indices=skin_info.check_indices,
+            check_positions=positions[skin_info.check_indices],
+        ),
+    )
 
 
 def assign_action_to_armature(
@@ -471,6 +612,7 @@ def process_single_animation(
     output_dir: Path,
     frame_gap: int,
     export_format: str,
+    skin_info: SkinInfo,
 ) -> tuple[int, int]:
     imported: list[bpy.types.Object] = []
     frame_count = 0
@@ -514,10 +656,12 @@ def process_single_animation(
             scene.frame_set(frame)
             bpy.context.view_layer.update()
 
-            export_path = (
-                output_dir / f"{anim_label}_{frame}" / f"clean.{export_format}"
+            sample_dir = output_dir / f"{anim_label}_{frame}"
+            export_path = sample_dir / f"clean.{export_format}"
+            positions = export_frame_clean(base_mesh_objects, export_path, export_format)
+            write_pose_sidecar(
+                char_armature, skin_info, positions, sample_dir, frame, anim_fbx.stem
             )
-            export_frame_clean(base_mesh_objects, export_path, export_format)
             frame_count += 1
             file_count += 1
 
@@ -577,6 +721,7 @@ def process_character(
     )
 
     base_mesh_objects, char_armature = init_base_scene(mesh_fbx)
+    skin_info = write_skin_sidecar(base_mesh_objects, char_armature, character_output)
 
     processed = 0
     total_frames = 0
@@ -594,6 +739,7 @@ def process_character(
                 character_output,
                 frame_gap,
                 export_format,
+                skin_info,
             )
             total_frames += frames
             total_files += files
@@ -629,6 +775,7 @@ def run_pipeline(
     shuffle_armatures: bool = SHUFFLE_ARMATURES,
     random_seed: int = RANDOM_SEED,
 ) -> None:
+    started_at = utc_now()
     in_path = Path(bpy.path.abspath(input_dir)).expanduser().resolve()
     out_path = Path(bpy.path.abspath(output_dir)).expanduser().resolve()
 
@@ -720,6 +867,32 @@ def run_pipeline(
         except OSError as exc:
             log(f"Failed to write skipped_characters.txt: {exc}")
     log(summary)
+    write_stage_manifest(
+        out_path,
+        "stage1",
+        params={
+            "input_dir": str(in_path),
+            "frame_gap": frame_gap,
+            "max_characters": max_characters,
+            "character_start": character_start,
+            "max_armatures": max_armatures,
+            "armature_start": armature_start,
+            "export_format": export_format,
+            "shuffle_armatures": shuffle_armatures,
+            "random_seed": random_seed,
+        },
+        counts={
+            "characters": len(character_entries),
+            "characters_ok": chars_ok,
+            "animations_attempted": total_anim_attempted,
+            "animations_ok": total_anim_ok,
+            "samples": total_frames,
+            "failed": (len(character_entries) - chars_ok)
+            + (total_anim_attempted - total_anim_ok),
+        },
+        started_at=started_at,
+        extra={"skipped_characters": skipped},
+    )
     show_popup("Animation Frame Sampler", summary, icon="INFO")
 
 
