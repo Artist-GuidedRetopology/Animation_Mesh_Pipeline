@@ -143,18 +143,49 @@ def displace_tangent_plane(bm: bmesh.types.BMesh, magnitude: float) -> None:
         vert.co += tangent * u + bitangent * v
 
 
-def collapse_edges_robust(
-    bm: bmesh.types.BMesh, edges: list[bmesh.types.BMEdge]
-) -> int:
-    collapsed_count = 0
+def _independent_edge_batch(
+    edges: list[bmesh.types.BMEdge],
+) -> tuple[list[bmesh.types.BMEdge], list[bmesh.types.BMEdge]]:
+    """Split edges into a vertex-disjoint batch and the rest."""
+    used: set[bmesh.types.BMVert] = set()
+    batch: list[bmesh.types.BMEdge] = []
+    rest: list[bmesh.types.BMEdge] = []
     for edge in edges:
         if not edge.is_valid:
             continue
-        try:
-            bmesh.ops.collapse(bm, edges=[edge], uvs=False)
-            collapsed_count += 1
-        except Exception:
+        a, b = edge.verts
+        if a in used or b in used:
+            rest.append(edge)
             continue
+        used.update((a, b))
+        batch.append(edge)
+    return batch, rest
+
+
+def collapse_edges_robust(
+    bm: bmesh.types.BMesh, edges: list[bmesh.types.BMEdge], max_rounds: int = 8
+) -> int:
+    # Each bmesh.ops call costs O(mesh size), so collapse vertex-disjoint
+    # batches (same result as one-by-one) instead of one edge per call.
+    collapsed_count = 0
+    pending = list(edges)
+    for _ in range(max_rounds):
+        batch, pending = _independent_edge_batch(pending)
+        if not batch:
+            break
+        try:
+            bmesh.ops.collapse(bm, edges=batch, uvs=False)
+            collapsed_count += len(batch)
+        except Exception:
+            for edge in batch:
+                if not edge.is_valid:
+                    continue
+                try:
+                    bmesh.ops.collapse(bm, edges=[edge], uvs=False)
+                    collapsed_count += 1
+                except Exception:
+                    continue
+        pending = [edge for edge in pending if edge.is_valid]
     refresh_bmesh_indices(bm)
     return collapsed_count
 

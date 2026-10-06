@@ -189,16 +189,25 @@ def process_clean_file(
     skip_existing: bool = False,
     random_seed: int = RANDOM_SEED,
 ) -> int:
-    if not strengths:
-        return 0
-
-    written = 0
+    jobs = []
     for strength in strengths:
         label = strength_label(strength)
         out_path = clean_path.parent / f"dirty{label}.{export_format}"
-        if skip_existing and out_path.is_file():
-            continue
+        if not (skip_existing and out_path.is_file()):
+            jobs.append((strength, out_path))
+    if not jobs:
+        return 0
 
+    clear_scene()
+    sources = import_mesh_file(clean_path)
+    if not sources:
+        raise RuntimeError(f"No mesh imported from: {clean_path}")
+    for src in sources:
+        src.name = "clean_source"
+
+    collection = bpy.context.scene.collection
+    written = 0
+    for strength, out_path in jobs:
         # Stable per-output seed makes interruption/resume reproducible.
         seed_key = f"{random_seed}:{clean_path.as_posix()}:{float(strength)}"
         file_seed = int.from_bytes(
@@ -207,22 +216,28 @@ def process_clean_file(
         )
         random.seed(file_seed)
         params = replace(base_params, displace_strength=float(strength))
-        clear_scene()
-        mesh_objects = import_mesh_file(clean_path)
-        if not mesh_objects:
-            raise RuntimeError(f"No mesh imported from: {clean_path}")
 
-        for obj in mesh_objects:
+        dirty_objects = []
+        for src in sources:
+            obj = src.copy()
+            obj.data = src.data.copy()
+            collection.objects.link(obj)
             apply_dirty_topology_to_mesh(obj.data, params)
             obj.name = "mesh"
+            dirty_objects.append(obj)
 
         bpy.ops.object.select_all(action="DESELECT")
-        for obj in mesh_objects:
+        for obj in dirty_objects:
             obj.select_set(True)
-        bpy.context.view_layer.objects.active = mesh_objects[0]
+        bpy.context.view_layer.objects.active = dirty_objects[0]
 
         export_selected_meshes(out_path, export_format)
         written += 1
+
+        for obj in dirty_objects:
+            mesh = obj.data
+            bpy.data.objects.remove(obj)
+            bpy.data.meshes.remove(mesh)
 
     return written
 
